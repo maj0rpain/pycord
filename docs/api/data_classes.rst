@@ -26,6 +26,31 @@ dynamic attributes in mind.
 .. autoclass:: SelectOption
     :members:
 
+.. attributetable:: SelectDefaultValue
+
+.. autoclass:: SelectDefaultValue
+    :members:
+
+.. attributetable:: MediaGalleryItem
+
+.. autoclass:: MediaGalleryItem
+    :members:
+
+.. attributetable:: UnfurledMediaItem
+
+.. autoclass:: UnfurledMediaItem
+    :members:
+
+.. attributetable:: RadioGroupOption
+
+.. autoclass:: RadioGroupOption
+    :members:
+
+.. attributetable:: CheckboxGroupOption
+
+.. autoclass:: CheckboxGroupOption
+    :members:
+
 .. attributetable:: Intents
 
 .. autoclass:: Intents

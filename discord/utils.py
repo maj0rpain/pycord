@@ -30,8 +30,11 @@ import asyncio
 import collections.abc
 import datetime
 import functools
+import importlib.resources
+import io
 import itertools
 import json
+import logging
 import re
 import sys
 import types
@@ -62,7 +65,26 @@ from typing import (
     overload,
 )
 
-from .errors import HTTPException, InvalidArgument
+from typing_extensions import deprecated as ext_deprecated
+
+if TYPE_CHECKING:
+    from discord import (
+        Client,
+        VoiceChannel,
+        TextChannel,
+        ForumChannel,
+        StageChannel,
+        CategoryChannel,
+        Thread,
+        Member,
+        User,
+        Guild,
+        Role,
+        GuildEmoji,
+        AppEmoji,
+    )
+
+from .errors import HTTPException, InvalidArgument, InvalidData
 
 try:
     import msgspec
@@ -97,9 +119,29 @@ __all__ = (
     "generate_snowflake",
     "basic_autocomplete",
     "filter_params",
+    "MISSING",
+    "users_to_csv",
 )
 
+_log = logging.getLogger(__name__)
+
 DISCORD_EPOCH = 1420070400000
+
+try:
+    with (
+        importlib.resources.files(__package__)
+        .joinpath("emojis.json")
+        .open(encoding="utf-8") as f
+    ):
+        EMOJIS_MAP = json.load(f)
+except FileNotFoundError:
+    _log.debug(
+        "Couldn't find emojis.json. Is the package data missing? Discord emojis names will not work.",
+    )
+    EMOJIS_MAP = {}
+
+
+UNICODE_EMOJIS = set(EMOJIS_MAP.values())
 
 
 class _MissingSentinel:
@@ -115,22 +157,6 @@ class _MissingSentinel:
 
 MISSING: Any = _MissingSentinel()
 
-
-class _cached_property:
-    def __init__(self, function):
-        self.function = function
-        self.__doc__ = getattr(function, "__doc__")
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-
-        value = self.function(instance)
-        setattr(instance, self.function.__name__, value)
-
-        return value
-
-
 if TYPE_CHECKING:
     from typing_extensions import ParamSpec
 
@@ -144,12 +170,9 @@ if TYPE_CHECKING:
     class _RequestLike(Protocol):
         headers: Mapping[str, Any]
 
-    cached_property = property
-
     P = ParamSpec("P")
 
 else:
-    cached_property = _cached_property
     AutocompleteContext = Any
     OptionChoice = Any
 
@@ -312,7 +335,6 @@ def warn_deprecated(
     stacklevel: :class:`int`
         The stacklevel kwarg passed to :func:`warnings.warn`. Defaults to 3.
     """
-    warnings.simplefilter("always", DeprecationWarning)  # turn off filter
     message = f"{name} is deprecated"
     if since:
         message += f" since version {since}"
@@ -325,9 +347,11 @@ def warn_deprecated(
         message += f" See {reference} for more information."
 
     warnings.warn(message, stacklevel=stacklevel, category=DeprecationWarning)
-    warnings.simplefilter("default", DeprecationWarning)  # reset filter
 
 
+@ext_deprecated(
+    "deprecated is deprecated since version 2.8, consider using warnings.deprecated instead."
+)
 def deprecated(
     instead: str | None = None,
     since: str | None = None,
@@ -339,6 +363,9 @@ def deprecated(
 ) -> Callable[[Callable[[P], T]], Callable[[P], T]]:
     """A decorator implementation of :func:`warn_deprecated`. This will automatically call :func:`warn_deprecated` when
     the decorated function is called.
+
+    .. deprecated:: 2.8
+        Deprecated in favor of :func:`warnings.deprecated`.
 
     Parameters
     ----------
@@ -567,64 +594,231 @@ def get(iterable: Iterable[T], **attrs: Any) -> T | None:
     return None
 
 
-async def get_or_fetch(obj, attr: str, id: int, *, default: Any = MISSING) -> Any:
-    """|coro|
+_FETCHABLE = TypeVar(
+    "_FETCHABLE",
+    bound="VoiceChannel | TextChannel | ForumChannel | StageChannel | CategoryChannel | Thread | Member | User | Guild | Role | GuildEmoji | AppEmoji",
+)
+_D = TypeVar("_D")
+_Getter = Callable[[Any, int], Any]
+_Fetcher = Callable[[Any, int], Awaitable[Any]]
 
-    Attempts to get an attribute from the object in cache. If it fails, it will attempt to fetch it.
-    If the fetch also fails, an error will be raised.
+
+# TODO: In version 3.0, remove the 'attr' and 'id' arguments.
+#       Also, eliminate the default 'MISSING' value for both 'object_type' and 'object_id'.
+@overload
+async def get_or_fetch(
+    obj: Guild | Client,
+    object_type: type[_FETCHABLE],
+    object_id: Literal[None],
+    default: _D = ...,
+    attr: str = ...,
+    id: int = ...,
+) -> None | _D: ...
+
+
+@overload
+async def get_or_fetch(
+    obj: Guild | Client,
+    object_type: type[_FETCHABLE],
+    object_id: int,
+    default: _D,
+    attr: str = ...,
+    id: int = ...,
+) -> _FETCHABLE | _D: ...
+
+
+@overload
+async def get_or_fetch(
+    obj: Guild | Client,
+    object_type: type[_FETCHABLE],
+    object_id: int,
+    *,
+    attr: str = ...,
+    id: int = ...,
+) -> _FETCHABLE: ...
+
+
+async def get_or_fetch(
+    obj: Guild | Client,
+    object_type: type[_FETCHABLE] = MISSING,
+    object_id: int | None = MISSING,
+    default: _D = MISSING,
+    attr: str = MISSING,
+    id: int = MISSING,
+) -> _FETCHABLE | _D | None:
+    """
+    Shortcut method to get data from an object either by returning the cached version, or if it does not exist, attempting to fetch it from the API.
 
     Parameters
     ----------
-    obj: Any
-        The object to use the get or fetch methods in
-    attr: :class:`str`
-        The attribute to get or fetch. Note the object must have both a ``get_`` and ``fetch_`` method for this attribute.
-    id: :class:`int`
-        The ID of the object
-    default: Any
-        The default value to return if the object is not found, instead of raising an error.
+    obj: :class:`~discord.Guild` | :class:`~discord.Client`
+        The object to operate on.
+
+    object_type: Type[:class:`~discord.VoiceChannel` | :class:`~discord.TextChannel` | :class:`~discord.ForumChannel` | :class:`~discord.StageChannel` | :class:`~discord.CategoryChannel` | :class:`~discord.Thread` | :class:`~discord.User` | :class:`~discord.Guild` | :class:`~discord.Role` | :class:`~discord.Member` | :class:`~discord.GuildEmoji` | :class:`~discord.AppEmoji`]
+        Type of object to fetch or get.
+
+    object_id: :class:`int` | :data:`None`
+        ID of object to get.
+
+    default: Any | :data:`None`
+        The value to return instead of raising if fetching fails.
 
     Returns
     -------
-    Any
-        The object found or the default value.
+    :class:`~discord.VoiceChannel` | :class:`~discord.TextChannel` | :class:`~discord.ForumChannel` | :class:`~discord.StageChannel` | :class:`~discord.CategoryChannel` | :class:`~discord.Thread` | :class:`~discord.User` | :class:`~discord.Guild` | :class:`~discord.Role` | :class:`~discord.Member` | :class:`~discord.GuildEmoji` | :class:`~discord.AppEmoji` | :data:`None`
+        The object if found, or `default` if provided when not found.
+        Returns :data:`None` only if `object_id` is :data:`None` and no `default` is given.
 
     Raises
     ------
-    :exc:`AttributeError`
-        The object is missing a ``get_`` or ``fetch_`` method
+    :exc:`TypeError`
+        Raised when required parameters are missing or invalid types are provided.
+    :exc:`InvalidArgument`
+        Raised when an unsupported or incompatible object type is used.
     :exc:`NotFound`
-        Invalid ID for the object
+        Invalid ID for the object.
     :exc:`HTTPException`
-        An error occurred fetching the object
+        An error occurred fetching the object.
     :exc:`Forbidden`
-        You do not have permission to fetch the object
-
-    Examples
-    --------
-
-    Getting a guild from a guild ID: ::
-
-        guild = await utils.get_or_fetch(client, 'guild', guild_id)
-
-    Getting a channel from the guild. If the channel is not found, return None: ::
-
-        channel = await utils.get_or_fetch(guild, 'channel', channel_id, default=None)
+        You do not have permission to fetch the object.
+    :exc:`InvalidData`
+        Raised when the object resolves to a different guild.
     """
-    getter = getattr(obj, f"get_{attr}")(id)
-    if getter is None:
-        try:
-            getter = await getattr(obj, f"fetch_{attr}")(id)
-        except AttributeError:
-            getter = await getattr(obj, f"_fetch_{attr}")(id)
-            if getter is None:
-                raise ValueError(f"Could not find {attr} with id {id} on {obj}")
-        except (HTTPException, ValueError):
-            if default is not MISSING:
-                return default
-            else:
-                raise
-    return getter
+    from discord import AppEmoji, Client, Guild, Member, Role, User
+
+    if object_id is None:
+        return default if default is not MISSING else None
+
+    # Temporary backward compatibility for 'attr' and 'id'.
+    # This entire if block should be removed in version 3.0.
+    if attr is not MISSING or id is not MISSING or isinstance(object_type, str):
+        warn_deprecated(
+            name="get_or_fetch(obj, attr='type', id=...)",
+            instead="get_or_fetch(obj, object_type=Type, object_id=...)",
+            since="2.7",
+            removed="3.0",
+        )
+
+        deprecated_attr = attr if attr is not MISSING else object_type
+        deprecated_id = id if id is not MISSING else object_id
+
+        if isinstance(deprecated_attr, str):
+            mapped_type = _get_string_to_type_map().get(deprecated_attr.lower())
+            if mapped_type is None:
+                raise InvalidArgument(
+                    f"Unknown type string '{deprecated_attr}' used. Please use a valid class like `discord.Member` instead."
+                )
+            object_type = mapped_type
+        elif isinstance(deprecated_attr, type):
+            object_type = deprecated_attr
+        else:
+            raise TypeError(
+                f"Invalid `attr` or `object_type`: expected a string or class, got {type(deprecated_attr).__name__}."
+            )
+
+        object_id = deprecated_id
+
+    if object_type is MISSING or object_id is MISSING:
+        raise TypeError("required parameters: `object_type` and `object_id`.")
+
+    if isinstance(obj, Guild) and object_type is User:
+        raise InvalidArgument("Guild cannot get_or_fetch User. Use Client instead.")
+    elif isinstance(obj, Client) and object_type is Member:
+        raise InvalidArgument("Client cannot get_or_fetch Member. Use Guild instead.")
+    elif isinstance(obj, Client) and object_type is Role:
+        raise InvalidArgument("Client cannot get_or_fetch Role. Use Guild instead.")
+    elif isinstance(obj, Guild) and object_type is Guild:
+        raise InvalidArgument("Guild cannot get_or_fetch Guild. Use Client instead.")
+    elif isinstance(obj, Guild) and object_type is AppEmoji:
+        raise InvalidArgument("Guild cannot get_or_fetch AppEmoji. Use Client instead.")
+
+    try:
+        getter, fetcher = _get_getter_fetcher_map()[object_type]
+    except KeyError:
+        raise InvalidArgument(
+            f"Class {object_type.__name__} cannot be used with discord.{type(obj).__name__}.get_or_fetch()"
+        )
+
+    result = getter(obj, object_id)
+    if result is not None:
+        return result
+
+    try:
+        return await fetcher(obj, object_id)
+    except (HTTPException, ValueError, InvalidData):
+        if default is not MISSING:
+            return default
+        raise
+
+
+@functools.lru_cache(maxsize=1)
+def _get_string_to_type_map() -> dict[str, type]:
+    """Return a cached map of lowercase strings -> discord types."""
+    from discord import AppEmoji, Guild, Member, Role, User, abc, emoji
+
+    return {
+        "channel": abc.GuildChannel,
+        "member": Member,
+        "user": User,
+        "guild": Guild,
+        "emoji": emoji._EmojiTag,
+        "appemoji": AppEmoji,
+        "role": Role,
+    }
+
+
+@functools.lru_cache(maxsize=1)
+def _get_getter_fetcher_map() -> dict[type, tuple[_Getter, _Fetcher]]:
+    """Return a cached map of type names -> (getter, fetcher) functions."""
+    from discord import Guild, Member, Role, Thread, User, abc, emoji
+
+    base_map: dict[type, tuple[_Getter, _Fetcher]] = {
+        Member: (
+            lambda obj, oid: obj.get_member(oid),
+            lambda obj, oid: obj.fetch_member(oid),
+        ),
+        Role: (
+            lambda obj, oid: obj.get_role(oid),
+            lambda obj, oid: obj.fetch_role(oid),
+        ),
+        User: (
+            lambda obj, oid: obj.get_user(oid),
+            lambda obj, oid: obj.fetch_user(oid),
+        ),
+        Guild: (
+            lambda obj, oid: obj.get_guild(oid),
+            lambda obj, oid: obj.fetch_guild(oid),
+        ),
+        emoji._EmojiTag: (
+            lambda obj, oid: obj.get_emoji(oid),
+            lambda obj, oid: obj.fetch_emoji(oid),
+        ),
+        abc.GuildChannel: (
+            lambda obj, oid: obj.get_channel(oid),
+            lambda obj, oid: obj.fetch_channel(oid),
+        ),
+        Thread: (
+            lambda obj, oid: obj.get_channel(oid),
+            lambda obj, oid: obj.fetch_channel(oid),
+        ),
+    }
+
+    expanded: dict[type, tuple[_Getter, _Fetcher]] = {}
+    for base, funcs in base_map.items():
+        expanded[base] = funcs
+        for subclass in _all_subclasses(base):
+            if subclass not in expanded:
+                expanded[subclass] = funcs
+
+    return expanded
+
+
+def _all_subclasses(cls: type) -> set[type]:
+    """Recursively collect all subclasses of a class."""
+    subs = set(cls.__subclasses__())
+    for sub in cls.__subclasses__():
+        subs |= _all_subclasses(sub)
+    return subs
 
 
 def _unique(iterable: Iterable[T]) -> list[T]:
@@ -640,7 +834,7 @@ def _get_as_snowflake(data: Any, key: str) -> int | None:
         return value and int(value)
 
 
-def _get_mime_type_for_image(data: bytes):
+def _get_mime_type_for_file(data: bytes):
     if data.startswith(b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"):
         return "image/png"
     elif data[0:3] == b"\xff\xd8\xff" or data[6:10] in (b"JFIF", b"Exif"):
@@ -649,13 +843,15 @@ def _get_mime_type_for_image(data: bytes):
         return "image/gif"
     elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "image/webp"
+    elif data.startswith(b"\x49\x44\x33") or data.startswith(b"\xff\xfb"):
+        return "audio/mpeg"
     else:
-        raise InvalidArgument("Unsupported image type given")
+        raise InvalidArgument("Unsupported file type given")
 
 
 def _bytes_to_base64_data(data: bytes) -> str:
     fmt = "data:{mime};base64,{data}"
-    mime = _get_mime_type_for_image(data)
+    mime = _get_mime_type_for_file(data)
     b64 = b64encode(data).decode("ascii")
     return fmt.format(mime=mime, data=b64)
 
@@ -1419,3 +1615,20 @@ def filter_params(params, **kwargs):
                 params[new_param] = params.pop(old_param)
 
     return params
+
+
+def users_to_csv(users: Iterable[Snowflake]) -> io.BytesIO:
+    """Converts an iterable of users to a CSV file-like object for usage in
+    :meth:`~discord.abc.GuildChannel.create_invite` and :meth:`~discord.Invite.edit_target_users`.
+
+    Parameters
+    ----------
+    users: Iterable[:class:`discord.abc.Snowflake`]
+        An iterable of users to convert.
+
+    Returns
+    -------
+    :class:`io.BytesIO`
+        A file-like object containing the CSV data.
+    """
+    return io.BytesIO("\n".join(map(lambda u: str(u.id), users)).encode("utf-8"))

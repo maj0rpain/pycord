@@ -1,7 +1,6 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2021 Rapptz
 Copyright (c) 2021-present Pycord Development
 
 Permission is hereby granted, free of charge, to any person obtaining a
@@ -23,10 +22,15 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
-from typing import TypeVar
+from __future__ import annotations
 
-V = TypeVar("V")
+from typing import TypedDict
+
+from .snowflake import Snowflake
 
 
-async def coroutine(val: V) -> V:
-    return val
+class PrimaryGuild(TypedDict):
+    identity_guild_id: Snowflake
+    identity_enabled: bool | None
+    tag: str
+    badge: str

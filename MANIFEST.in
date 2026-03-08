@@ -3,6 +3,7 @@ include LICENSE
 include requirements.txt
 include discord/bin/*.dll
 include discord/py.typed
+include discord/emojis.json
 
 prune .github
 prune docs
@@ -16,4 +17,3 @@ exclude .prettierrc
 exclude .readthedocs.yml
 exclude CHANGELOG.md
 exclude FUNDING.yml
-exclude requirements-dev.txt

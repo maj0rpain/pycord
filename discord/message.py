@@ -32,6 +32,7 @@ from os import PathLike
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncGenerator,
     Callable,
     ClassVar,
     Sequence,
@@ -59,7 +60,7 @@ from .poll import Poll
 from .reaction import Reaction
 from .sticker import StickerItem
 from .threads import Thread
-from .utils import MISSING, escape_mentions
+from .utils import MISSING, escape_mentions, find, warn_deprecated
 
 if TYPE_CHECKING:
     from .abc import (
@@ -84,6 +85,7 @@ if TYPE_CHECKING:
     from .types.message import MessageActivity as MessageActivityPayload
     from .types.message import MessageApplication as MessageApplicationPayload
     from .types.message import MessageCall as MessageCallPayload
+    from .types.message import MessagePin as MessagePinPayload
     from .types.message import MessageReference as MessageReferencePayload
     from .types.message import MessageSnapshot as MessageSnapshotPayload
     from .types.message import Reaction as ReactionPayload
@@ -91,7 +93,7 @@ if TYPE_CHECKING:
     from .types.snowflake import SnowflakeList
     from .types.threads import ThreadArchiveDuration
     from .types.user import User as UserPayload
-    from .ui.view import View
+    from .ui.view import BaseView
     from .user import User
 
     MR = TypeVar("MR", bound="MessageReference")
@@ -105,6 +107,7 @@ __all__ = (
     "MessageCall",
     "DeletedReferencedMessage",
     "ForwardedMessage",
+    "MessageSnapshot",
 )
 
 
@@ -146,7 +149,9 @@ class Attachment(Hashable):
 
         .. describe:: hash(x)
 
-            Returns the hash of the attachment.
+            Returns the attachment's unique identifier.
+
+            This is equivalent to :attr:`id`.
 
     .. versionchanged:: 1.7
         Attachment can now be cast to :class:`str` and is hashable.
@@ -287,6 +292,7 @@ class Attachment(Hashable):
         *,
         seek_begin: bool = True,
         use_cached: bool = False,
+        chunksize: int | None = None,
     ) -> int:
         """|coro|
 
@@ -308,6 +314,8 @@ class Attachment(Hashable):
             after the message is deleted. Note that this can still fail to download
             deleted attachments if too much time has passed, and it does not work
             on some types of attachments.
+        chunksize: Optional[:class:`int`]
+            The maximum size of each chunk to process. Must be a positive integer.
 
         Returns
         -------
@@ -320,16 +328,33 @@ class Attachment(Hashable):
             Saving the attachment failed.
         NotFound
             The attachment was deleted.
+        InvalidArgument
+            Argument `chunksize` is less than 1.
         """
-        data = await self.read(use_cached=use_cached)
+        if chunksize is not None:
+            data = self.read_chunked(use_cached=use_cached, chunksize=chunksize)
+        else:
+            data = await self.read(use_cached=use_cached)
+
         if isinstance(fp, io.BufferedIOBase):
-            written = fp.write(data)
+            if chunksize is not None:
+                written = 0
+                async for chunk in data:
+                    written += fp.write(chunk)
+            else:
+                written = fp.write(data)
             if seek_begin:
                 fp.seek(0)
             return written
         else:
             with open(fp, "wb") as f:
-                return f.write(data)
+                if chunksize is not None:
+                    written = 0
+                    async for chunk in data:
+                        written += f.write(chunk)
+                    return written
+                else:
+                    return f.write(data)
 
     async def read(self, *, use_cached: bool = False) -> bytes:
         """|coro|
@@ -365,6 +390,45 @@ class Attachment(Hashable):
         url = self.proxy_url if use_cached else self.url
         data = await self._http.get_from_cdn(url)
         return data
+
+    async def read_chunked(
+        self, chunksize: int, *, use_cached: bool = False
+    ) -> AsyncGenerator[bytes]:
+        """|coro|
+
+        Retrieves the content of this attachment in chunks as a :class:`AsyncGenerator` object of bytes.
+
+        Parameters
+        ----------
+        chunksize: :class:`int`
+            The maximum size of each chunk to process. Must be a positive integer.
+        use_cached: :class:`bool`
+            Whether to use :attr:`proxy_url` rather than :attr:`url` when downloading
+            the attachment. This will allow attachments to be saved after deletion
+            more often, compared to the regular URL which is generally deleted right
+            after the message is deleted. Note that this can still fail to download
+            deleted attachments if too much time has passed, and it does not work
+            on some types of attachments.
+
+        Yields
+        ------
+        :class:`bytes`
+            A chunk of the file.
+
+        Raises
+        ------
+        HTTPException
+            Downloading the attachment failed.
+        Forbidden
+            You do not have permissions to access this attachment
+        NotFound
+            The attachment was deleted.
+        InvalidArgument
+            Argument `chunksize` is less than 1.
+        """
+        url = self.proxy_url if use_cached else self.url
+        async for chunk in self._http.stream_from_cdn(url, chunksize):
+            yield chunk
 
     async def to_file(self, *, use_cached: bool = False, spoiler: bool = False) -> File:
         """|coro|
@@ -684,10 +748,17 @@ class ForwardedMessage:
         A list of attachments given to the original message.
     flags: :class:`MessageFlags`
         Extra features of the original message.
-    mentions: List[Union[:class:`abc.User`, :class:`Object`]]
-        A list of :class:`Member` that were originally mentioned.
-    role_mentions: List[Union[:class:`Role`, :class:`Object`]]
+    mentions: List[:class:`User`]
+        A list of :class:`User` that were originally mentioned.
+
+        .. note::
+            This list will be empty if the message was forwarded to a different place, e.g., from a DM to a guild, or
+            from one guild to another.
+    role_mentions: List[:class:`Role`]
         A list of :class:`Role` that were originally mentioned.
+
+        .. warning::
+            This is only available using :meth:`abc.Messageable.fetch_message`.
     stickers: List[:class:`StickerItem`]
         A list of sticker items given to the original message.
     components: List[:class:`Component`]
@@ -729,6 +800,17 @@ class ForwardedMessage:
         self.components: list[Component] = [
             _component_factory(d) for d in data.get("components", [])
         ]
+        self.mentions: list[User] = [
+            state.create_user(data=user) for user in data["mentions"]
+        ]
+        self.role_mentions: list[Role] = []
+        if isinstance(self.guild, Guild) and data.get("mention_roles"):
+            for role_id in map(int, data["mention_roles"]):
+                role = self.guild.get_role(role_id)
+                if role is not None:
+                    self.role_mentions.append(role)
+
+        self.type: MessageType = try_enum(MessageType, data["type"])
         self._edited_timestamp: datetime.datetime | None = utils.parse_time(
             data["edited_timestamp"]
         )
@@ -789,6 +871,38 @@ def flatten_handlers(cls):
     cls._HANDLERS = handlers
     cls._CACHED_SLOTS = [attr for attr in cls.__slots__ if attr.startswith("_cs_")]
     return cls
+
+
+class MessagePin:
+    """Represents information about a pinned message.
+
+    .. versionadded:: 2.7
+    """
+
+    def __init__(
+        self,
+        state: ConnectionState,
+        channel: MessageableChannel,
+        data: MessagePinPayload,
+    ):
+        self._state: ConnectionState = state
+        self._pinned_at: datetime.datetime = utils.parse_time(data["pinned_at"])
+        self._message: Message = state.create_message(
+            channel=channel, data=data["message"]
+        )
+
+    @property
+    def message(self) -> Message:
+        """The pinned message."""
+        return self._message
+
+    @property
+    def pinned_at(self) -> datetime.datetime:
+        """An aware timestamp of when the message was pinned."""
+        return self._pinned_at
+
+    def __repr__(self) -> str:
+        return f"<MessagePin pinned_at={self.pinned_at!r} message={self.message!r}>"
 
 
 @flatten_handlers
@@ -928,7 +1042,7 @@ class Message(Hashable):
         The call information associated with this message, if applicable.
 
         .. versionadded:: 2.6
-    snapshots: Optional[List[:class:`MessageSnapshots`]]
+    snapshots: Optional[List[:class:`MessageSnapshot`]]
         The snapshots attached to this message, if applicable.
 
         .. versionadded:: 2.7
@@ -1018,7 +1132,7 @@ class Message(Hashable):
             StickerItem(data=d, state=state) for d in data.get("sticker_items", [])
         ]
         self.components: list[Component] = [
-            _component_factory(d) for d in data.get("components", [])
+            _component_factory(d, state=state) for d in data.get("components", [])
         ]
 
         try:
@@ -1173,26 +1287,6 @@ class Message(Hashable):
         del self.reactions[index]
         return reaction
 
-    def _update(self, data):
-        # In an update scheme, 'author' key has to be handled before 'member'
-        # otherwise they overwrite each other which is undesirable.
-        # Since there's no good way to do this we have to iterate over every
-        # handler rather than iterating over the keys which is a little slower
-        for key, handler in self._HANDLERS:
-            try:
-                value = data[key]
-            except KeyError:
-                continue
-            else:
-                handler(self, value)
-
-        # clear the cached properties
-        for attr in self._CACHED_SLOTS:
-            try:
-                delattr(self, attr)
-            except AttributeError:
-                pass
-
     def _handle_edited_timestamp(self, value: str) -> None:
         self._edited_timestamp = utils.parse_time(value)
 
@@ -1281,7 +1375,7 @@ class Message(Hashable):
                     self.role_mentions.append(role)
 
     def _handle_components(self, components: list[ComponentPayload]):
-        self.components = [_component_factory(d) for d in components]
+        self.components = [_component_factory(d, state=self._state) for d in components]
 
     def _rebind_cached_references(
         self, new_guild: Guild, new_channel: TextChannel | Thread
@@ -1643,9 +1737,10 @@ class Message(Hashable):
         files: list[File] | None = ...,
         attachments: list[Attachment] = ...,
         suppress: bool = ...,
+        suppress_embeds: bool = ...,
         delete_after: float | None = ...,
         allowed_mentions: AllowedMentions | None = ...,
-        view: View | None = ...,
+        view: BaseView | None = ...,
     ) -> Message: ...
 
     async def edit(
@@ -1657,9 +1752,10 @@ class Message(Hashable):
         files: list[Sequence[File]] = MISSING,
         attachments: list[Attachment] = MISSING,
         suppress: bool = MISSING,
+        suppress_embeds: bool = MISSING,
         delete_after: float | None = None,
         allowed_mentions: AllowedMentions | None = MISSING,
-        view: View | None = MISSING,
+        view: BaseView | None = MISSING,
     ) -> Message:
         """|coro|
 
@@ -1695,6 +1791,15 @@ class Message(Hashable):
             all the embeds if set to ``True``. If set to ``False``
             this brings the embeds back if they were suppressed.
             Using this parameter requires :attr:`~.Permissions.manage_messages`.
+
+            .. deprecated:: 2.8
+        suppress_embeds: :class:`bool`
+            Whether to suppress embeds for the message. This removes
+            all the embeds if set to ``True``. If set to ``False``
+            this brings the embeds back if they were suppressed.
+            Using this parameter requires :attr:`~.Permissions.manage_messages`.
+
+            .. versionadded:: 2.8
         delete_after: Optional[:class:`float`]
             If provided, the number of seconds to wait in the background
             before deleting the message we just edited. If the deletion fails,
@@ -1708,7 +1813,7 @@ class Message(Hashable):
             are used instead.
 
             .. versionadded:: 1.4
-        view: Optional[:class:`~discord.ui.View`]
+        view: Optional[:class:`~discord.ui.BaseView`]
             The updated view to update this message with. If ``None`` is passed then
             the view is removed.
 
@@ -1740,10 +1845,15 @@ class Message(Hashable):
         elif embeds is not MISSING:
             payload["embeds"] = [e.to_dict() for e in embeds]
 
+        flags = MessageFlags._from_value(self.flags.value)
+
         if suppress is not MISSING:
-            flags = MessageFlags._from_value(self.flags.value)
-            flags.suppress_embeds = suppress
-            payload["flags"] = flags.value
+            warn_deprecated("suppress", "suppress_embeds", "2.8")
+            if suppress_embeds is MISSING:
+                suppress_embeds = suppress
+
+        if suppress_embeds is not MISSING:
+            flags.suppress_embeds = suppress_embeds
 
         if allowed_mentions is MISSING:
             if (
@@ -1765,8 +1875,13 @@ class Message(Hashable):
         if view is not MISSING:
             self._state.prevent_view_updates_for(self.id)
             payload["components"] = view.to_components() if view else []
+            if view and view.is_components_v2():
+                flags.is_components_v2 = True
         if file is not MISSING and files is not MISSING:
             raise InvalidArgument("cannot pass both file and files parameter to edit()")
+
+        if flags.value != self.flags.value:
+            payload["flags"] = flags.value
 
         if file is not MISSING or files is not MISSING:
             if file is not MISSING:
@@ -1802,7 +1917,9 @@ class Message(Hashable):
 
         if view and not view.is_finished():
             view.message = message
-            self._state.store_view(view, self.id)
+            view.refresh(message.components)
+            if view.is_dispatchable():
+                self._state.store_view(view, self.id)
 
         if delete_after is not None:
             await self.delete(delay=delete_after)
@@ -1834,7 +1951,7 @@ class Message(Hashable):
 
         Pins the message.
 
-        You must have the :attr:`~Permissions.manage_messages` permission to do
+        You must have the :attr:`~Permissions.pin_messages` permission to do
         this in a non-private channel context.
 
         Parameters
@@ -1863,7 +1980,7 @@ class Message(Hashable):
 
         Unpins the message.
 
-        You must have the :attr:`~Permissions.manage_messages` permission to do
+        You must have the :attr:`~Permissions.pin_messages` permission to do
         this in a non-private channel context.
 
         Parameters
@@ -2202,6 +2319,32 @@ class Message(Hashable):
 
         return data
 
+    def get_component(self, id: str | int) -> Component | None:
+        """Gets a component from this message. Roughly equal to `utils.get(message.components, ...)`.
+        If an :class:`int` is provided, the component will be retrieved by ``id``, otherwise by  ``custom_id``.
+        This method will also search nested components.
+
+        Parameters
+        ----------
+        id: Union[:class:`str`, :class:`int`]
+            The id or custom_id the item to get
+
+        Returns
+        -------
+        Optional[:class:`Component`]
+            The component with the matching ``custom_id`` or ``id`` if it exists.
+        """
+        if not id:
+            return None
+        attr = "id" if isinstance(id, int) else "custom_id"
+        for i in self.components:
+            if getattr(i, attr, None) == id:
+                return i
+            elif hasattr(i, "get_component"):
+                if component := i.get_component(id):
+                    return component
+        return None
+
 
 class PartialMessage(Hashable):
     """Represents a partial message to aid with working messages when only
@@ -2364,7 +2507,7 @@ class PartialMessage(Hashable):
             to the object, otherwise it uses the attributes set in :attr:`~discord.Client.allowed_mentions`.
             If no object is passed at all then the defaults given by :attr:`~discord.Client.allowed_mentions`
             are used instead.
-        view: Optional[:class:`~discord.ui.View`]
+        view: Optional[:class:`~discord.ui.BaseView`]
             The updated view to update this message with. If ``None`` is passed then
             the view is removed.
 
@@ -2443,7 +2586,9 @@ class PartialMessage(Hashable):
             msg = self._state.create_message(channel=self.channel, data=data)  # type: ignore
             if view and not view.is_finished():
                 view.message = msg
-                self._state.store_view(view, self.id)
+                view.refresh(msg.components)
+                if view.is_dispatchable():
+                    self._state.store_view(view, self.id)
             return msg
 
     async def end_poll(self) -> Message:

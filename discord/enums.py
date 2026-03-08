@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import types
 from collections import namedtuple
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, Union
 
 __all__ = (
@@ -71,6 +72,7 @@ __all__ = (
     "PromptType",
     "OnboardingMode",
     "ReactionType",
+    "VoiceChannelEffectAnimationType",
     "SKUType",
     "EntitlementType",
     "EntitlementOwnerType",
@@ -78,6 +80,13 @@ __all__ = (
     "InteractionContextType",
     "PollLayoutType",
     "MessageReferenceType",
+    "ThreadArchiveDuration",
+    "RoleType",
+    "SubscriptionStatus",
+    "SeparatorSpacingSize",
+    "SelectDefaultValueType",
+    "ApplicationEventWebhookStatus",
+    "InviteTargetUsersJobStatusCode",
 )
 
 
@@ -661,7 +670,6 @@ class StickerFormatType(Enum):
             StickerFormatType.lottie: "json",
             StickerFormatType.gif: "gif",
         }
-        # TODO: Improve handling of unknown sticker format types if possible
         return lookup.get(self, "png")
 
 
@@ -720,6 +728,19 @@ class ComponentType(Enum):
     role_select = 6
     mentionable_select = 7
     channel_select = 8
+    section = 9
+    text_display = 10
+    thumbnail = 11
+    media_gallery = 12
+    file = 13
+    separator = 14
+    content_inventory_entry = 16
+    container = 17
+    label = 18
+    file_upload = 19
+    radio_group = 21
+    checkbox_group = 22
+    checkbox = 23
 
     def __int__(self):
         return self.value
@@ -1043,7 +1064,7 @@ class EntitlementOwnerType(Enum):
 
 
 class IntegrationType(Enum):
-    """The application's integration type"""
+    """The application's integration type."""
 
     guild_install = 0
     user_install = 1
@@ -1063,6 +1084,16 @@ class PollLayoutType(Enum):
     default = 1
 
 
+class VoiceChannelEffectAnimationType(Enum):
+    """Voice channel effect animation type.
+
+    .. versionadded:: 2.7
+    """
+
+    premium = 0
+    basic = 1
+
+
 class MessageReferenceType(Enum):
     """The type of the message reference object"""
 
@@ -1076,6 +1107,98 @@ class SubscriptionStatus(Enum):
     active = 0
     ending = 1
     inactive = 2
+
+
+class ThreadArchiveDuration(IntEnum):
+    """The time set until a thread is automatically archived."""
+
+    one_hour = 60
+    one_day = 1440
+    three_days = 4320
+    one_week = 10080
+
+
+class SeparatorSpacingSize(Enum):
+    """A separator component's spacing size."""
+
+    small = 1
+    large = 2
+
+    def __int__(self):
+        return self.value
+
+
+class SelectDefaultValueType(Enum):
+    """Represents the default value type of a select menu."""
+
+    channel = "channel"
+    role = "role"
+    user = "user"
+
+
+class RoleType(IntEnum):
+    """Represents the type of role.
+
+    This is NOT provided by Discord but is rather computed based on :attr:`Role.tags`.
+
+    .. versionadded:: 2.8
+
+    Attributes
+    ----------
+    NORMAL: :class:`int`
+        The role is a normal role.
+    APPLICATION: :class:`int`
+        The role is an application (bot) role.
+    BOOSTER: :class:`int`
+        The role is a guild's booster role.
+    GUILD_PRODUCT: :class:`int`
+        The role is a guild product role.
+
+        .. note::
+            This is not possible to determine at times because role tags seem to be missing altogether, notably when
+            a role is fetched. In such cases :attr:`Role.type` and :attr:`Role.tags` will both be :data:`None`.
+    PREMIUM_SUBSCRIPTION_BASE: :class:`int`
+        The role is a base subscription role.
+
+        .. note::
+            This is not possible to determine currently, will be :attr:`.INTEGRATION` if it's a base subscription.
+    PREMIUM_SUBSCRIPTION_TIER: :class:`int`
+        The role is a subscription role.
+    DRAFT_PREMIUM_SUBSCRIPTION_TIER: :class:`int`
+        The role is a draft subscription role.
+    INTEGRATION: :class:`int`
+        The role is an integration role, such as Twitch or YouTube, or a base subscription role.
+    CONNECTION: :class:`int`
+        The role is a guild connections role.
+    UNKNOWN: :class:`int`
+        The role type is unknown.
+    """
+
+    NORMAL = 0
+    APPLICATION = 1
+    BOOSTER = 2
+    GUILD_PRODUCT = 3  # Not possible to determine *at times* because role tags seem to be missing altogether when fetched
+    PREMIUM_SUBSCRIPTION_BASE = 4  # Not possible to determine currently, will be INTEGRATION if it's a base subscription
+    PREMIUM_SUBSCRIPTION_TIER = 5
+    DRAFT_PREMIUM_SUBSCRIPTION_TIER = 6
+    INTEGRATION = 7
+    CONNECTION = 8
+    UNKNOWN = 9
+
+
+class ApplicationEventWebhookStatus(Enum):
+    """Represents the application event webhook status."""
+
+    disabled = 1
+    enabled = 2
+    disabled_by_discord = 3
+
+
+class InviteTargetUsersJobStatusCode(Enum):
+    unspecified = 0
+    processing = 1
+    completed = 2
+    failed = 3
 
 
 T = TypeVar("T")
